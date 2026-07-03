@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Model Bridge"
+  short_description: "Connect external LLMs to Codex as MCP agents."
+  default_prompt: "Use $codex-model-bridge to add an external OpenAI-compatible model as a Codex MCP agent."

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+.env.*
+config.json
+private-config.json
+*.local.json
+.DS_Store
