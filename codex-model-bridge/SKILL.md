@@ -19,16 +19,22 @@ Use this skill to install and operate a local MCP server that exposes external L
 
 ## Quick Workflow
 
-1. Copy `assets/config.example.json` to a private location, usually `~/.codex/model-bridge/config.json`.
-2. Edit provider names, endpoints, model ids, and environment variable names.
-3. Set provider API keys as user environment variables.
-4. Validate the config:
+1. Confirm Python 3.10 or newer is available.
+2. Prefer the interactive configurator, which supports presets and fully custom OpenAI-compatible models:
 
 ```bash
-python path/to/codex-model-bridge/scripts/model_bridge.py validate-config --config path/to/config.json
+python path/to/scripts/model_bridge.py configure --config ~/.codex/model-bridge/config.json
 ```
 
-5. Add an MCP entry to Codex config pointing to the bridge server:
+3. When a model supports thinking, explicitly ask the user whether to enable it by default. Do not infer support for unknown APIs. The configurator records the choice without storing an API key.
+4. Set provider API keys as user environment variables, then restart the terminal and Codex so they inherit the new values.
+5. Run the local diagnostics:
+
+```bash
+python path/to/scripts/model_bridge.py doctor --config ~/.codex/model-bridge/config.json
+```
+
+6. Add an MCP entry to Codex config pointing to the bridge server:
 
 ```toml
 [mcp_servers.model_bridge]
@@ -36,14 +42,16 @@ command = "python"
 args = ["path/to/codex-model-bridge/scripts/model_bridge.py", "serve", "--config", "path/to/config.json"]
 ```
 
-6. Restart Codex so it reloads the MCP server.
-7. Use the exposed tools, for example `ask_glm_5_2`, `ask_deepseek`, or `compare_external_models`, depending on the config.
+7. Restart Codex so it reloads the MCP server.
+8. Use `model_bridge_status` first, then a configured model tool or `compare_external_models`.
 
 ## Common Tasks
 
 ### Add A New Model
 
-Edit the private JSON config. Add one object to `models` with a unique `id`, `tool_name`, provider `endpoint`, `model`, and secret environment variable name.
+Run `configure` again or edit the private JSON config. Each model can define a unique `id`, `tool_name`, provider `endpoint`, remote `model`, environment variable names, and optional headers or request fields. Set `enabled` to `false` to keep a model in the config without exposing it to Codex.
+
+Declare `capabilities.thinking` and `capabilities.reasoning_effort` only when the provider supports those request fields. Use `thinking_field` and `thinking_values` for APIs that encode the toggle as a different field, string, boolean, or custom JSON value. Store defaults in `extra_body`; the bridge exposes per-call overrides only for declared capabilities. Existing configs that already contain these fields in `extra_body` remain compatible.
 
 Use `references/providers.md` when configuring common providers such as Z.AI GLM, DeepSeek, Qwen, Kimi, OpenRouter, or generic OpenAI-compatible endpoints.
 
@@ -52,10 +60,10 @@ Use `references/providers.md` when configuring common providers such as Z.AI GLM
 Use the CLI before wiring the model into Codex:
 
 ```bash
-python path/to/scripts/model_bridge.py ask --config path/to/config.json --model glm-5-2 --prompt "Reply with OK."
+python path/to/scripts/model_bridge.py ask --config path/to/config.json --model glm-5-2 --prompt "Reply with OK." --max-tokens 128 --thinking disabled
 ```
 
-For a low-cost test, set `max_tokens` small and disable provider-specific reasoning options if supported.
+Use `--thinking disabled` only when `doctor` reports that thinking is supported.
 
 ### Expose Tools To Codex
 
@@ -67,7 +75,7 @@ Run the MCP server through Codex config. The bridge creates one MCP tool per con
 - `reasoning_effort`: optional provider-specific reasoning strength.
 - `max_tokens`, `temperature`: generation controls.
 
-The bridge also exposes `compare_external_models` when two or more models are configured.
+The bridge always exposes `model_bridge_status`. It also exposes `compare_external_models` when two or more models are enabled; its default call skips models whose API keys are not detected.
 
 ## Resources
 

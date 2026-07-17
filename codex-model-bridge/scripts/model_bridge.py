@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -22,6 +23,40 @@ if hasattr(sys.stderr, "reconfigure"):
 
 
 DEFAULT_PROTOCOL_VERSION = "2025-03-26"
+BRIDGE_VERSION = "0.2.0"
+THINKING_MODES = ("enabled", "disabled")
+REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+RESERVED_TOOL_NAMES = {"compare_external_models", "model_bridge_status"}
+
+PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
+    "glm": {
+        "id": "glm-5-2",
+        "tool_name": "ask_glm_5_2",
+        "display_name": "GLM 5.2",
+        "endpoint": "https://api.z.ai/api/paas/v4/chat/completions",
+        "api_key_envs": ["ZAI_API_KEY", "ZHIPU_API_KEY"],
+        "model": "glm-5.2",
+        "capabilities": {"thinking": True, "reasoning_effort": True},
+    },
+    "deepseek": {
+        "id": "deepseek-chat",
+        "tool_name": "ask_deepseek",
+        "display_name": "DeepSeek Chat",
+        "endpoint": "https://api.deepseek.com/chat/completions",
+        "api_key_envs": ["DEEPSEEK_API_KEY"],
+        "model": "deepseek-chat",
+        "capabilities": {"thinking": False, "reasoning_effort": False},
+    },
+    "qwen": {
+        "id": "qwen-plus",
+        "tool_name": "ask_qwen",
+        "display_name": "Qwen Plus",
+        "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        "api_key_envs": ["DASHSCOPE_API_KEY"],
+        "model": "qwen-plus",
+        "capabilities": {"thinking": False, "reasoning_effort": False},
+    },
+}
 
 
 def clean(value: Any) -> Any:
@@ -52,6 +87,8 @@ def validate_config(config: dict[str, Any]) -> None:
     for index, model in enumerate(models):
         if not isinstance(model, dict):
             raise ValueError(f"models[{index}] must be an object.")
+        if "enabled" in model and not isinstance(model["enabled"], bool):
+            raise ValueError(f"models[{index}].enabled must be true or false.")
         for field in ("id", "endpoint", "model"):
             if not model.get(field):
                 raise ValueError(f"models[{index}] is missing '{field}'.")
@@ -61,6 +98,8 @@ def validate_config(config: dict[str, Any]) -> None:
         seen_ids.add(model_id)
 
         tool_name = tool_name_for(model)
+        if tool_name in RESERVED_TOOL_NAMES:
+            raise ValueError(f"Reserved tool name cannot be used by a model: {tool_name}")
         if tool_name in seen_tools:
             raise ValueError(f"Duplicate tool name: {tool_name}")
         if not re.fullmatch(r"[a-zA-Z0-9_]+", tool_name):
@@ -71,15 +110,57 @@ def validate_config(config: dict[str, Any]) -> None:
         if not envs:
             raise ValueError(f"Model {model_id} must define api_key_env or api_key_envs.")
 
+        capabilities = model.get("capabilities") or {}
+        if not isinstance(capabilities, dict):
+            raise ValueError(f"Model {model_id} capabilities must be an object.")
+        for capability in ("thinking", "reasoning_effort"):
+            if capability in capabilities and not isinstance(capabilities[capability], bool):
+                raise ValueError(f"Model {model_id} capability '{capability}' must be true or false.")
+        if "thinking_field" in capabilities and not (
+            isinstance(capabilities["thinking_field"], str) and capabilities["thinking_field"].strip()
+        ):
+            raise ValueError(f"Model {model_id} capability 'thinking_field' must be a non-empty string.")
+        if "thinking_values" in capabilities:
+            values = capabilities["thinking_values"]
+            if not isinstance(values, dict) or not all(mode in values for mode in THINKING_MODES):
+                raise ValueError(
+                    f"Model {model_id} capability 'thinking_values' must define enabled and disabled."
+                )
+
+        extra_body = model.get("extra_body") or {}
+        if not isinstance(extra_body, dict):
+            raise ValueError(f"Model {model_id} extra_body must be an object.")
+        thinking_field = thinking_field_for(model)
+        if capabilities.get("thinking") is False and thinking_field in extra_body:
+            raise ValueError(
+                f"Model {model_id} sets extra_body.{thinking_field} while capabilities.thinking is false."
+            )
+        if capabilities.get("reasoning_effort") is False and "reasoning_effort" in extra_body:
+            raise ValueError(
+                f"Model {model_id} sets extra_body.reasoning_effort while "
+                "capabilities.reasoning_effort is false."
+            )
+
+
+def model_is_enabled(model: dict[str, Any]) -> bool:
+    return model.get("enabled", True) is not False
+
+
+def enabled_models(config: dict[str, Any]) -> list[dict[str, Any]]:
+    return [model for model in config["models"] if model_is_enabled(model)]
+
 
 def api_key_envs(model: dict[str, Any]) -> list[str]:
     if "api_key_envs" in model:
         envs = model["api_key_envs"]
         if isinstance(envs, str):
-            return [envs]
-        return [str(item) for item in envs]
+            return [envs.strip()] if envs.strip() else []
+        if isinstance(envs, list):
+            return [str(item).strip() for item in envs if str(item).strip()]
+        return []
     if "api_key_env" in model:
-        return [str(model["api_key_env"])]
+        env = str(model["api_key_env"]).strip()
+        return [env] if env else []
     return []
 
 
@@ -92,6 +173,55 @@ def api_key_for(model: dict[str, Any]) -> str:
     raise RuntimeError(f"Missing API key environment variable for {model['id']}: {names}")
 
 
+def detected_api_key_env(model: dict[str, Any]) -> str | None:
+    for env_name in api_key_envs(model):
+        if os.environ.get(env_name):
+            return env_name
+    return None
+
+
+def supports_capability(model: dict[str, Any], capability: str) -> bool:
+    capabilities = model.get("capabilities") or {}
+    if capability in capabilities:
+        return bool(capabilities[capability])
+    return capability in (model.get("extra_body") or {})
+
+
+def thinking_field_for(model: dict[str, Any]) -> str:
+    capabilities = model.get("capabilities") or {}
+    return str(capabilities.get("thinking_field") or "thinking").strip()
+
+
+def thinking_values_for(model: dict[str, Any]) -> dict[str, Any]:
+    capabilities = model.get("capabilities") or {}
+    configured = capabilities.get("thinking_values")
+    if isinstance(configured, dict) and all(mode in configured for mode in THINKING_MODES):
+        return configured
+    return {
+        "enabled": {"type": "enabled"},
+        "disabled": {"type": "disabled"},
+    }
+
+
+def thinking_value_for(model: dict[str, Any], mode: str) -> Any:
+    return copy.deepcopy(thinking_values_for(model)[mode])
+
+
+def default_thinking_mode(model: dict[str, Any]) -> str | None:
+    value = (model.get("extra_body") or {}).get(thinking_field_for(model))
+    for mode, configured_value in thinking_values_for(model).items():
+        if value == configured_value:
+            return mode
+    if isinstance(value, dict):
+        value = value.get("type")
+    return str(value) if value in THINKING_MODES else None
+
+
+def default_reasoning_effort(model: dict[str, Any]) -> str | None:
+    value = (model.get("extra_body") or {}).get("reasoning_effort")
+    return str(value) if value is not None else None
+
+
 def tool_name_for(model: dict[str, Any]) -> str:
     if model.get("tool_name"):
         return str(model["tool_name"])
@@ -99,8 +229,13 @@ def tool_name_for(model: dict[str, Any]) -> str:
     return f"ask_{safe}"
 
 
-def model_by_id_or_tool(config: dict[str, Any], name: str) -> dict[str, Any]:
-    for model in config["models"]:
+def model_by_id_or_tool(
+    config: dict[str, Any],
+    name: str,
+    include_disabled: bool = False,
+) -> dict[str, Any]:
+    models = config["models"] if include_disabled else enabled_models(config)
+    for model in models:
         if model["id"] == name or tool_name_for(model) == name:
             return model
     raise KeyError(f"Unknown model or tool: {name}")
@@ -144,8 +279,18 @@ def chat_completion(
 
     body.update(model.get("extra_body") or {})
     if thinking is not None:
-        body["thinking"] = {"type": thinking}
+        if not supports_capability(model, "thinking"):
+            raise ValueError(
+                f"Model {model['id']} is not configured with thinking support. "
+                "Set capabilities.thinking to true only if the provider supports it."
+            )
+        body[thinking_field_for(model)] = thinking_value_for(model, thinking)
     if reasoning_effort is not None:
+        if not supports_capability(model, "reasoning_effort"):
+            raise ValueError(
+                f"Model {model['id']} is not configured with reasoning_effort support. "
+                "Set capabilities.reasoning_effort to true only if the provider supports it."
+            )
         body["reasoning_effort"] = reasoning_effort
 
     data = json.dumps(clean(body), ensure_ascii=False).encode("utf-8")
@@ -180,27 +325,40 @@ def chat_completion(
 
 def tool_schema(model: dict[str, Any]) -> dict[str, Any]:
     display = model.get("display_name") or model["id"]
+    key_env = detected_api_key_env(model)
+    key_note = (
+        f"API key detected via {key_env}."
+        if key_env
+        else f"API key not detected; set one of: {', '.join(api_key_envs(model))}."
+    )
+    properties: dict[str, Any] = {
+        "prompt": {"type": "string", "description": "Task or question for the external model."},
+        "system": {"type": "string", "description": "Optional system instruction."},
+        "max_tokens": {"type": "integer", "minimum": 1},
+        "temperature": {"type": "number", "minimum": 0, "maximum": 2},
+    }
+    if supports_capability(model, "thinking"):
+        default_mode = default_thinking_mode(model)
+        default_note = f" Current config default: {default_mode}." if default_mode else ""
+        properties["thinking"] = {
+            "type": "string",
+            "enum": list(THINKING_MODES),
+            "description": "Enable or disable provider thinking for this call." + default_note,
+        }
+    if supports_capability(model, "reasoning_effort"):
+        default_effort = default_reasoning_effort(model)
+        default_note = f" Current config default: {default_effort}." if default_effort else ""
+        properties["reasoning_effort"] = {
+            "type": "string",
+            "enum": list(REASONING_EFFORTS),
+            "description": "Provider reasoning effort for this call." + default_note,
+        }
     return {
         "name": tool_name_for(model),
-        "description": f"Ask {display} as an external model agent for Codex.",
+        "description": f"Ask {display} as an external model agent for Codex. {key_note}",
         "inputSchema": {
             "type": "object",
-            "properties": {
-                "prompt": {"type": "string", "description": "Task or question for the external model."},
-                "system": {"type": "string", "description": "Optional system instruction."},
-                "thinking": {
-                    "type": "string",
-                    "enum": ["enabled", "disabled"],
-                    "description": "Provider-specific reasoning toggle when supported.",
-                },
-                "reasoning_effort": {
-                    "type": "string",
-                    "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-                    "description": "Provider-specific reasoning effort when supported.",
-                },
-                "max_tokens": {"type": "integer", "minimum": 1},
-                "temperature": {"type": "number", "minimum": 0, "maximum": 2},
-            },
+            "properties": properties,
             "required": ["prompt"],
             "additionalProperties": False,
         },
@@ -218,13 +376,28 @@ def compare_tool_schema() -> dict[str, Any]:
                 "models": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional model ids or tool names. Defaults to all configured models.",
+                    "description": (
+                        "Optional model ids or tool names. By default, models without detected API keys "
+                        "are skipped."
+                    ),
                 },
                 "system": {"type": "string"},
                 "max_tokens": {"type": "integer", "minimum": 1},
                 "temperature": {"type": "number", "minimum": 0, "maximum": 2},
             },
             "required": ["prompt"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def status_tool_schema() -> dict[str, Any]:
+    return {
+        "name": "model_bridge_status",
+        "description": "Show configured models, API key availability, and thinking defaults without exposing secrets.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
             "additionalProperties": False,
         },
     }
@@ -247,6 +420,27 @@ def mcp_error(code: int, message: str, data: Any = None) -> dict[str, Any]:
     return payload
 
 
+def model_status_line(model: dict[str, Any]) -> str:
+    state = "enabled" if model_is_enabled(model) else "disabled"
+    key_env = detected_api_key_env(model)
+    key_status = f"key found via {key_env}" if key_env else f"key missing ({', '.join(api_key_envs(model))})"
+    if supports_capability(model, "thinking"):
+        thinking = default_thinking_mode(model) or "provider default"
+        thinking_status = f"thinking supported, default {thinking}"
+    else:
+        thinking_status = "thinking not enabled for this model"
+    return f"- {model['id']} ({model['model']}): {state}; {key_status}; {thinking_status}"
+
+
+def format_bridge_status(config: dict[str, Any]) -> str:
+    ready = sum(1 for model in enabled_models(config) if detected_api_key_env(model))
+    active = len(enabled_models(config))
+    lines = [f"Model bridge: {ready}/{active} enabled model(s) have an API key."]
+    lines.extend(model_status_line(model) for model in config["models"])
+    lines.append("Restart Codex after adding or changing user environment variables.")
+    return "\n".join(lines)
+
+
 class McpServer:
     def __init__(self, config: dict[str, Any]):
         self.config = config
@@ -265,7 +459,7 @@ class McpServer:
                     "capabilities": {"tools": {"listChanged": False}},
                     "serverInfo": {
                         "name": server.get("name", "model-bridge"),
-                        "version": server.get("version", "0.1.0"),
+                        "version": server.get("version", BRIDGE_VERSION),
                     },
                 },
             )
@@ -279,8 +473,9 @@ class McpServer:
             return
 
         if method == "tools/list":
-            tools = [tool_schema(model) for model in self.config["models"]]
-            if len(self.config["models"]) > 1:
+            models = enabled_models(self.config)
+            tools = [status_tool_schema(), *[tool_schema(model) for model in models]]
+            if len(models) > 1:
                 tools.append(compare_tool_schema())
             mcp_respond(message_id, {"tools": tools})
             return
@@ -296,7 +491,9 @@ class McpServer:
         name = params.get("name")
         args = params.get("arguments") or {}
         try:
-            if name == "compare_external_models":
+            if name == "model_bridge_status":
+                text = format_bridge_status(self.config)
+            elif name == "compare_external_models":
                 text = self.compare_models(args)
             else:
                 model = model_by_id_or_tool(self.config, str(name))
@@ -319,8 +516,24 @@ class McpServer:
             )
 
     def compare_models(self, args: dict[str, Any]) -> str:
-        selected = args.get("models") or [model["id"] for model in self.config["models"]]
+        requested = args.get("models")
+        skipped: list[str] = []
+        if requested:
+            selected = [str(name) for name in requested]
+        else:
+            models = enabled_models(self.config)
+            if not models:
+                raise RuntimeError("No models are enabled in the bridge config.")
+            selected = [model["id"] for model in models if detected_api_key_env(model)]
+            skipped = [model["id"] for model in models if not detected_api_key_env(model)]
+            if not selected:
+                env_names = sorted({name for model in models for name in api_key_envs(model)})
+                raise RuntimeError(
+                    "No enabled model has a detected API key. Set one of: " + ", ".join(env_names)
+                )
         sections: list[str] = []
+        if skipped:
+            sections.append("Skipped models without detected API keys: " + ", ".join(skipped))
         for name in selected:
             model = model_by_id_or_tool(self.config, str(name))
             try:
@@ -364,19 +577,267 @@ def serve(config_path: str) -> int:
     return 0
 
 
+def prompt_text(label: str, default: str | None = None, required: bool = True) -> str:
+    suffix = f" [{default}]" if default not in (None, "") else ""
+    while True:
+        try:
+            value = input(f"{label}{suffix}: ").strip()
+        except EOFError as exc:
+            raise RuntimeError("Interactive configuration requires a terminal with stdin.") from exc
+        if value:
+            return value
+        if default is not None:
+            return default
+        if not required:
+            return ""
+        print("A value is required.")
+
+
+def prompt_yes_no(label: str, default: bool | None = None) -> bool:
+    suffix = " [Y/n]" if default is True else " [y/N]" if default is False else " [y/n]"
+    while True:
+        try:
+            value = input(f"{label}{suffix}: ").strip().lower()
+        except EOFError as exc:
+            raise RuntimeError("Interactive configuration requires a terminal with stdin.") from exc
+        if value in {"y", "yes"}:
+            return True
+        if value in {"n", "no"}:
+            return False
+        if not value and default is not None:
+            return default
+        print("Enter y or n.")
+
+
+def prompt_number(label: str, default: int | float, cast: Any, minimum: float) -> int | float:
+    while True:
+        raw = prompt_text(label, str(default))
+        try:
+            value = cast(raw)
+        except ValueError:
+            print("Enter a valid number.")
+            continue
+        if value < minimum:
+            print(f"Enter a value greater than or equal to {minimum}.")
+            continue
+        return value
+
+
+def prompt_choice(label: str, choices: tuple[str, ...], default: str) -> str:
+    while True:
+        value = prompt_text(label, default).lower()
+        if value in choices:
+            return value
+        print("Choose one of: " + ", ".join(choices) + ".")
+
+
+def prompt_json_value(label: str, default: Any) -> Any:
+    default_text = json.dumps(default, ensure_ascii=False, separators=(",", ":"))
+    while True:
+        raw = prompt_text(label, default_text)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            print("Enter a valid JSON value.")
+
+
+def thinking_value_style(model: dict[str, Any]) -> str:
+    values = thinking_values_for(model)
+    enabled = values["enabled"]
+    disabled = values["disabled"]
+    if isinstance(enabled, dict) and isinstance(disabled, dict):
+        return "object"
+    if enabled is True and disabled is False:
+        return "boolean"
+    if isinstance(enabled, str) and isinstance(disabled, str):
+        return "string"
+    return "custom"
+
+
+def choose_preset() -> dict[str, Any]:
+    print("Presets: glm, deepseek, qwen, custom")
+    aliases = {"1": "glm", "2": "deepseek", "3": "qwen", "4": "custom"}
+    while True:
+        choice = prompt_text("Choose a preset", "custom").lower()
+        choice = aliases.get(choice, choice)
+        if choice == "custom":
+            return {}
+        if choice in PROVIDER_PRESETS:
+            return copy.deepcopy(PROVIDER_PRESETS[choice])
+        print("Choose glm, deepseek, qwen, or custom.")
+
+
+def configure_model(base: dict[str, Any], requested_id: str | None = None) -> dict[str, Any]:
+    model = copy.deepcopy(base)
+    model_id = prompt_text("Local model id", requested_id or model.get("id"))
+    model["id"] = model_id
+    model["display_name"] = prompt_text("Display name", str(model.get("display_name") or model_id))
+    model["tool_name"] = prompt_text("Codex tool name", str(model.get("tool_name") or tool_name_for(model)))
+    model["endpoint"] = prompt_text("OpenAI-compatible chat completions endpoint", model.get("endpoint"))
+    model["model"] = prompt_text("Provider model id", str(model.get("model") or model_id))
+
+    env_default = ",".join(api_key_envs(model)) or "MODEL_API_KEY"
+    env_text = prompt_text("API key environment variable(s), comma-separated", env_default)
+    model["api_key_envs"] = [item.strip() for item in env_text.split(",") if item.strip()]
+    model.pop("api_key_env", None)
+
+    model["system"] = prompt_text(
+        "Default system instruction",
+        str(model.get("system") or "You are a careful external expert agent for Codex."),
+    )
+    model["temperature"] = prompt_number(
+        "Default temperature", float(model.get("temperature", 0.7)), float, 0
+    )
+    model["max_tokens"] = prompt_number(
+        "Default max tokens", int(model.get("max_tokens", 2048)), int, 1
+    )
+    model["enabled"] = prompt_yes_no("Expose this model to Codex", model_is_enabled(model))
+
+    capabilities = dict(model.get("capabilities") or {})
+    extra_body = dict(model.get("extra_body") or {})
+    old_thinking_field = thinking_field_for(model)
+    current_mode = default_thinking_mode(model)
+    supports_thinking = prompt_yes_no(
+        "Does this API support the thinking field?",
+        supports_capability(model, "thinking"),
+    )
+    capabilities["thinking"] = supports_thinking
+    if supports_thinking:
+        thinking_field = prompt_text("Thinking request field", old_thinking_field)
+        current_values = thinking_values_for(model)
+        current_style = thinking_value_style(model)
+        value_style = prompt_choice(
+            "Thinking value style (object, string, boolean, or custom)",
+            ("object", "string", "boolean", "custom"),
+            current_style,
+        )
+        if value_style == current_style and value_style != "custom":
+            thinking_values = copy.deepcopy(current_values)
+        elif value_style == "object":
+            thinking_values = {
+                "enabled": {"type": "enabled"},
+                "disabled": {"type": "disabled"},
+            }
+        elif value_style == "string":
+            thinking_values = {"enabled": "enabled", "disabled": "disabled"}
+        elif value_style == "boolean":
+            thinking_values = {"enabled": True, "disabled": False}
+        else:
+            thinking_values = {
+                "enabled": prompt_json_value("JSON value when thinking is enabled", current_values["enabled"]),
+                "disabled": prompt_json_value("JSON value when thinking is disabled", current_values["disabled"]),
+            }
+        capabilities["thinking_field"] = thinking_field
+        capabilities["thinking_values"] = thinking_values
+        if old_thinking_field != thinking_field:
+            extra_body.pop(old_thinking_field, None)
+        default_enabled = None if current_mode is None else current_mode == "enabled"
+        thinking_enabled = prompt_yes_no("Enable thinking by default", default_enabled)
+        mode = "enabled" if thinking_enabled else "disabled"
+        extra_body[thinking_field] = copy.deepcopy(thinking_values[mode])
+    else:
+        extra_body.pop(old_thinking_field, None)
+        capabilities.pop("thinking_field", None)
+        capabilities.pop("thinking_values", None)
+
+    supports_effort = prompt_yes_no(
+        "Does this API support reasoning_effort?",
+        supports_capability(model, "reasoning_effort"),
+    )
+    capabilities["reasoning_effort"] = supports_effort
+    if supports_effort:
+        current_effort = default_reasoning_effort(model) or ""
+        effort = prompt_text(
+            "Default reasoning effort (blank for provider default)",
+            current_effort,
+            required=False,
+        ).lower()
+        while effort and effort not in REASONING_EFFORTS:
+            print("Choose one of: " + ", ".join(REASONING_EFFORTS) + ", or leave blank.")
+            effort = prompt_text("Default reasoning effort", "", required=False).lower()
+        if effort:
+            extra_body["reasoning_effort"] = effort
+        else:
+            extra_body.pop("reasoning_effort", None)
+    else:
+        extra_body.pop("reasoning_effort", None)
+
+    model["capabilities"] = capabilities
+    if extra_body:
+        model["extra_body"] = extra_body
+    else:
+        model.pop("extra_body", None)
+    return model
+
+
+def command_configure(args: argparse.Namespace) -> int:
+    config_path = Path(args.config).expanduser()
+    if config_path.exists():
+        config = load_config(config_path)
+        print(f"Loaded {len(config['models'])} model(s) from {config_path}.")
+    else:
+        config = {"server": {"name": "model-bridge", "version": BRIDGE_VERSION}, "models": []}
+        print(f"Creating {config_path}.")
+
+    print("This wizard stores environment variable names only. It never asks for or stores API keys.")
+    while True:
+        existing: dict[str, Any] | None = None
+        requested_id: str | None = None
+        if config["models"]:
+            ids = ", ".join(str(model["id"]) for model in config["models"])
+            print(f"Configured model ids: {ids}")
+            requested_id = prompt_text("Model id to add or update", str(config["models"][0]["id"]))
+            existing = next((model for model in config["models"] if model["id"] == requested_id), None)
+
+        base = existing if existing is not None else choose_preset()
+        configured = configure_model(base, requested_id=requested_id)
+        replaced_ids = {configured["id"]}
+        if existing is not None:
+            replaced_ids.add(existing["id"])
+        config["models"] = [model for model in config["models"] if model["id"] not in replaced_ids]
+        config["models"].append(configured)
+
+        if not prompt_yes_no("Configure another model", False):
+            break
+
+    validate_config(config)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = config_path.with_name(config_path.name + ".tmp")
+    temp_path.write_text(json.dumps(clean(config), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temp_path.replace(config_path)
+
+    print(f"Saved {config_path}.")
+    print("Set an API key in one of the named environment variables, then restart Codex.")
+    print(f'Run doctor next: python "{Path(__file__).resolve()}" doctor --config "{config_path}"')
+    return 0
+
+
 def command_validate(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     print(f"OK: {len(config['models'])} model(s) configured.")
     for model in config["models"]:
-        print(f"- {model['id']} -> {tool_name_for(model)} ({model['model']})")
+        state = "enabled" if model_is_enabled(model) else "disabled"
+        print(f"- {model['id']} -> {tool_name_for(model)} ({model['model']}, {state})")
     return 0
+
+
+def command_doctor(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    version_state = "OK" if sys.version_info >= (3, 10) else "Python 3.10+ required"
+    print(f"Python: {version} ({version_state})")
+    print(f"Config: {Path(args.config).expanduser().resolve()}")
+    print(format_bridge_status(config))
+    return 0 if sys.version_info >= (3, 10) else 1
 
 
 def command_list_tools(args: argparse.Namespace) -> int:
     config = load_config(args.config)
-    for model in config["models"]:
+    print("model_bridge_status")
+    models = enabled_models(config)
+    for model in models:
         print(tool_name_for(model))
-    if len(config["models"]) > 1:
+    if len(models) > 1:
         print("compare_external_models")
     return 0
 
@@ -409,6 +870,10 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--config", required=True)
     serve_parser.set_defaults(func=lambda args: serve(args.config))
 
+    configure = sub.add_parser("configure", help="Interactively create or update a private bridge config.")
+    configure.add_argument("--config", required=True)
+    configure.set_defaults(func=command_configure)
+
     validate = sub.add_parser("validate-config", help="Validate bridge config.")
     validate.add_argument("--config", required=True)
     validate.set_defaults(func=command_validate)
@@ -417,13 +882,17 @@ def build_parser() -> argparse.ArgumentParser:
     list_tools.add_argument("--config", required=True)
     list_tools.set_defaults(func=command_list_tools)
 
+    doctor = sub.add_parser("doctor", help="Check config, API key availability, and thinking defaults.")
+    doctor.add_argument("--config", required=True)
+    doctor.set_defaults(func=command_doctor)
+
     ask = sub.add_parser("ask", help="Call one configured model from the CLI.")
     ask.add_argument("--config", required=True)
     ask.add_argument("--model", required=True, help="Model id or tool name.")
     ask.add_argument("--prompt", help="Prompt text. If omitted, stdin is used.")
     ask.add_argument("--system")
-    ask.add_argument("--thinking", choices=["enabled", "disabled"])
-    ask.add_argument("--reasoning-effort")
+    ask.add_argument("--thinking", choices=THINKING_MODES)
+    ask.add_argument("--reasoning-effort", choices=REASONING_EFFORTS)
     ask.add_argument("--max-tokens", type=int)
     ask.add_argument("--temperature", type=float)
     ask.add_argument("--json", action="store_true")
