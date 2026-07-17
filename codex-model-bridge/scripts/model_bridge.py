@@ -8,6 +8,7 @@ import copy
 import json
 import os
 import re
+import shlex
 import sys
 import traceback
 import urllib.error
@@ -23,7 +24,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 
 DEFAULT_PROTOCOL_VERSION = "2025-03-26"
-BRIDGE_VERSION = "0.2.0"
+BRIDGE_VERSION = "0.3.0"
 THINKING_MODES = ("enabled", "disabled")
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 RESERVED_TOOL_NAMES = {"compare_external_models", "model_bridge_status"}
@@ -109,6 +110,12 @@ def validate_config(config: dict[str, Any]) -> None:
         envs = api_key_envs(model)
         if not envs:
             raise ValueError(f"Model {model_id} must define api_key_env or api_key_envs.")
+        for env_name in envs:
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name):
+                raise ValueError(
+                    f"Model {model_id} API key environment variable must contain only letters, "
+                    f"digits, and underscores, and cannot start with a digit: {env_name}"
+                )
 
         capabilities = model.get("capabilities") or {}
         if not isinstance(capabilities, dict):
@@ -438,6 +445,117 @@ def format_bridge_status(config: dict[str, Any]) -> str:
     lines = [f"Model bridge: {ready}/{active} enabled model(s) have an API key."]
     lines.extend(model_status_line(model) for model in config["models"])
     lines.append("Restart Codex after adding or changing user environment variables.")
+    return "\n".join(lines)
+
+
+def models_for_key_help(
+    config: dict[str, Any],
+    model_name: str | None = None,
+) -> list[dict[str, Any]]:
+    if model_name:
+        return [model_by_id_or_tool(config, model_name, include_disabled=True)]
+    return enabled_models(config)
+
+
+def powershell_quote(value: str | Path) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def format_key_help(
+    config: dict[str, Any],
+    config_path: str | Path,
+    model_name: str | None = None,
+    platform_name: str | None = None,
+    script_path: str | Path | None = None,
+) -> str:
+    platform_name = platform_name or ("windows" if os.name == "nt" else "posix")
+    if platform_name not in {"windows", "posix"}:
+        raise ValueError("platform_name must be 'windows' or 'posix'.")
+
+    models = models_for_key_help(config, model_name)
+    resolved_script = Path(script_path or __file__).resolve()
+    resolved_config = Path(config_path).expanduser().resolve()
+    lines = [
+        "API KEY SETUP - LOCAL COMPUTER ONLY",
+        "Do not paste an API key into Codex, chat, GitHub, screenshots, or the JSON config.",
+        "The bridge is an external MCP agent. These steps do not change Codex's own login or primary model.",
+    ]
+
+    if not models:
+        lines.append("No enabled models are configured.")
+        return "\n".join(lines)
+
+    for model in models:
+        display = str(model.get("display_name") or model["id"])
+        env_names = api_key_envs(model)
+        detected_env = detected_api_key_env(model)
+        env_name = detected_env or env_names[0]
+        status = f"A key is currently detected via {detected_env}." if detected_env else "No key is detected yet."
+        thinking_arg = " --thinking disabled" if supports_capability(model, "thinking") else ""
+
+        lines.extend(
+            [
+                "",
+                f"MODEL: {display} ({model['id']})",
+                status,
+                f"Accepted environment variable name(s): {', '.join(env_names)}",
+                f"The commands below use: {env_name}",
+                "1. Create or copy a key in the model provider's own console.",
+                "2. Replace PASTE_YOUR_KEY_HERE locally. Never send the real value to an assistant.",
+            ]
+        )
+
+        if platform_name == "windows":
+            script_text = powershell_quote(resolved_script)
+            config_text = powershell_quote(resolved_config)
+            model_text = powershell_quote(str(model["id"]))
+            lines.extend(
+                [
+                    f'   [Environment]::SetEnvironmentVariable("{env_name}", "PASTE_YOUR_KEY_HERE", "User")',
+                    "3. Success is silent: PowerShell prints nothing and simply returns to the PS prompt.",
+                    "   This is normal. Do not assume it failed just because no message appeared.",
+                    "4. Verify safely without displaying the key:",
+                    (
+                        f'   if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable("{env_name}", '
+                        f'"User"))) {{ "NOT SET" }} else {{ "SET" }}'
+                    ),
+                    "5. Close that PowerShell window and open a new one so it inherits the new value.",
+                    "6. In the new window, run the checks:",
+                    f"   python {script_text} doctor --config {config_text}",
+                    (
+                        f"   python {script_text} ask --config {config_text} --model {model_text} "
+                        f"--prompt 'Reply exactly: OK' --max-tokens 32{thinking_arg}"
+                    ),
+                ]
+            )
+        else:
+            script_text = shlex.quote(str(resolved_script))
+            config_text = shlex.quote(str(resolved_config))
+            lines.extend(
+                [
+                    f"   export {env_name}='PASTE_YOUR_KEY_HERE'",
+                    "3. Success is silent: export prints nothing and returns to the shell prompt.",
+                    "4. Verify safely without displaying the key:",
+                    f'   if [ -n "${{{env_name}:-}}" ]; then echo "SET"; else echo "NOT SET"; fi',
+                    "5. This export applies to the current terminal. Use the same terminal for the checks:",
+                    f"   python {script_text} doctor --config {config_text}",
+                    (
+                        f"   python {script_text} ask --config {config_text} --model {shlex.quote(str(model['id']))} "
+                        f"--prompt 'Reply exactly: OK' --max-tokens 32{thinking_arg}"
+                    ),
+                    "6. For persistence, use your shell profile or OS secret manager, then restart Codex.",
+                ]
+            )
+
+        lines.extend(
+            [
+                "7. Add the MCP entry and restart Codex only after the real request returns OK.",
+                "To replace this key later, revoke the old key in the provider console and run the same",
+                f"environment-variable command with the new value. Keep the name {env_name} unchanged.",
+                "You do not need to edit the bridge JSON or Codex authentication settings.",
+            ]
+        )
+
     return "\n".join(lines)
 
 
@@ -807,8 +925,8 @@ def command_configure(args: argparse.Namespace) -> int:
     temp_path.replace(config_path)
 
     print(f"Saved {config_path}.")
-    print("Set an API key in one of the named environment variables, then restart Codex.")
-    print(f'Run doctor next: python "{Path(__file__).resolve()}" doctor --config "{config_path}"')
+    print()
+    print(format_key_help(config, config_path))
     return 0
 
 
@@ -828,7 +946,31 @@ def command_doctor(args: argparse.Namespace) -> int:
     print(f"Python: {version} ({version_state})")
     print(f"Config: {Path(args.config).expanduser().resolve()}")
     print(format_bridge_status(config))
+    missing = [model for model in enabled_models(config) if not detected_api_key_env(model)]
+    if missing:
+        print()
+        print("One or more enabled models are missing an API key.")
+        print(
+            f'Run: python "{Path(__file__).resolve()}" key-help --config '
+            f'"{Path(args.config).expanduser().resolve()}"'
+        )
+    else:
+        print()
+        print("Environment-variable presence check passed. A real provider request is still required.")
     return 0 if sys.version_info >= (3, 10) else 1
+
+
+def command_key_help(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    print(
+        format_key_help(
+            config,
+            args.config,
+            model_name=args.model,
+            platform_name=args.platform,
+        )
+    )
+    return 0
 
 
 def command_list_tools(args: argparse.Namespace) -> int:
@@ -885,6 +1027,12 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="Check config, API key availability, and thinking defaults.")
     doctor.add_argument("--config", required=True)
     doctor.set_defaults(func=command_doctor)
+
+    key_help = sub.add_parser("key-help", help="Show safe local API key setup and replacement steps.")
+    key_help.add_argument("--config", required=True)
+    key_help.add_argument("--model", help="Optional model id or tool name.")
+    key_help.add_argument("--platform", choices=["windows", "posix"])
+    key_help.set_defaults(func=command_key_help)
 
     ask = sub.add_parser("ask", help="Call one configured model from the CLI.")
     ask.add_argument("--config", required=True)

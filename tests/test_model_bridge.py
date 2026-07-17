@@ -1,5 +1,6 @@
 import argparse
 import importlib.util
+import io
 import json
 import os
 import tempfile
@@ -30,6 +31,12 @@ def sample_model(model_id: str, env_name: str) -> dict:
 
 
 class ModelBridgeTests(unittest.TestCase):
+    def test_config_rejects_unsafe_environment_variable_names(self) -> None:
+        model = sample_model("unsafe", "BAD-KEY-NAME")
+
+        with self.assertRaisesRegex(ValueError, "environment variable"):
+            model_bridge.validate_config({"models": [model]})
+
     def test_schema_only_exposes_supported_reasoning_controls(self) -> None:
         unsupported = sample_model("plain", "PLAIN_KEY")
         supported = sample_model("reasoner", "REASONER_KEY")
@@ -107,6 +114,40 @@ class ModelBridgeTests(unittest.TestCase):
         self.assertIn("key found via READY_KEY", status)
         self.assertNotIn(secret, status)
 
+    def test_windows_key_help_explains_silent_success_and_safe_verification(self) -> None:
+        config = {"models": [sample_model("beginner-model", "BEGINNER_API_KEY")]}
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            output = model_bridge.format_key_help(
+                config,
+                "C:/Users/example/.codex/model-bridge/config.json",
+                platform_name="windows",
+                script_path="C:/Users/example/.codex/skills/codex-model-bridge/scripts/model_bridge.py",
+            )
+
+        self.assertIn("Success is silent: PowerShell prints nothing", output)
+        self.assertIn('else { "SET" }', output)
+        self.assertIn("Do not paste an API key into Codex", output)
+        self.assertIn("do not change Codex's own login or primary model", output)
+        self.assertIn("You do not need to edit the bridge JSON", output)
+
+    def test_key_help_uses_detected_fallback_environment_variable_without_printing_key(self) -> None:
+        model = sample_model("fallback-model", "FIRST_API_KEY")
+        model["api_key_envs"] = ["FIRST_API_KEY", "SECOND_API_KEY"]
+        secret = "never-print-this-value"
+
+        with mock.patch.dict(os.environ, {"SECOND_API_KEY": secret}, clear=True):
+            output = model_bridge.format_key_help(
+                {"models": [model]},
+                "config.json",
+                platform_name="windows",
+                script_path="model_bridge.py",
+            )
+
+        self.assertIn("currently detected via SECOND_API_KEY", output)
+        self.assertIn('SetEnvironmentVariable("SECOND_API_KEY"', output)
+        self.assertNotIn(secret, output)
+
     def test_compare_skips_models_without_detected_keys_by_default(self) -> None:
         config = {
             "models": [
@@ -152,8 +193,10 @@ class ModelBridgeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
             with mock.patch("builtins.input", side_effect=lambda _prompt: next(answers)):
-                result = model_bridge.command_configure(argparse.Namespace(config=str(config_path)))
+                with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                    result = model_bridge.command_configure(argparse.Namespace(config=str(config_path)))
             config = json.loads(config_path.read_text(encoding="utf-8"))
+            configure_output = stdout.getvalue()
 
         self.assertEqual(result, 0)
         self.assertEqual(config["models"][0]["api_key_envs"], ["MY_MODEL_API_KEY"])
@@ -165,6 +208,7 @@ class ModelBridgeTests(unittest.TestCase):
         )
         self.assertEqual(config["models"][0]["extra_body"]["thinking"]["type"], "enabled")
         self.assertNotIn("secret", json.dumps(config).lower())
+        self.assertIn("Success is silent: PowerShell prints nothing", configure_output)
 
 
 if __name__ == "__main__":

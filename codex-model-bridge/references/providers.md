@@ -2,6 +2,8 @@
 
 Use OpenAI-compatible chat completion endpoints whenever possible. Each configured model needs an `endpoint`, `model`, and one or more `api_key_envs`.
 
+Prefer a provider-specific environment variable name to avoid conflicts with Codex and other applications. Run `key-help` after configuration; it explains local setup, silent command success, safe verification, testing, and later key replacement without displaying the key.
+
 ## Z.AI GLM
 
 Example endpoint:

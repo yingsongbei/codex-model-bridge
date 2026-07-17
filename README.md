@@ -1,18 +1,35 @@
 # codex-model-bridge
 
-Add external OpenAI-compatible LLMs to Codex as MCP-powered model agents.
+Connect GLM, DeepSeek, Qwen, Kimi, OpenRouter, or another OpenAI-compatible model to Codex as an external MCP model agent.
 
-Use GLM, DeepSeek, Qwen, Kimi, OpenRouter, or a custom endpoint as an external reviewer, writer, planner, code critic, or second-opinion model. Codex remains the orchestrator.
+Codex remains the main orchestrator. The external model appears as an `ask_*` tool that Codex calls only when needed.
+
+## What This Does Not Change
+
+The bridge does not replace the Codex model, change the Codex login, or modify Codex billing and authentication. It does not set Codex's global `model`, `model_provider`, or API endpoint.
+
+Installation adds only one local MCP server entry:
+
+```toml
+[mcp_servers.model_bridge]
+```
+
+Use provider-specific environment variable names such as `ZHIPU_API_KEY` or `DEEPSEEK_API_KEY`. Avoid reusing `OPENAI_API_KEY` unless you intentionally understand the effect on other applications.
 
 ## Requirements
 
 - Python 3.10 or newer
 - Codex with local MCP server support
-- An API key from each external provider you want to call
+- An API key created in the external model provider's own console
+- Git, unless you download the repository as a ZIP file
 
-## Install
+Never paste a real API key into Codex, another AI chat, GitHub, a screenshot, or the bridge JSON file.
+
+## Step 1: Install The Skill
 
 This repository contains the distributable Skill in the inner `codex-model-bridge/` folder. Copy that inner folder, not the repository root.
+
+If you do not use Git, click **Code > Download ZIP** on GitHub, extract the ZIP, open the extracted repository folder, and copy its inner `codex-model-bridge` folder to `C:\Users\<you>\.codex\skills\codex-model-bridge`. Do not copy the outer repository folder as the Skill.
 
 ### Windows PowerShell
 
@@ -32,61 +49,107 @@ mkdir -p ~/.codex/skills/codex-model-bridge
 cp -R ./codex-model-bridge/. ~/.codex/skills/codex-model-bridge/
 ```
 
-The installed file should be `~/.codex/skills/codex-model-bridge/SKILL.md`.
+Confirm that this file exists:
 
-## Configure Models
+```text
+~/.codex/skills/codex-model-bridge/SKILL.md
+```
 
-Run the interactive configurator. It offers GLM, DeepSeek, and Qwen starters, but every endpoint, model id, tool name, and environment variable remains editable. Choose `custom` for any OpenAI-compatible API.
+## Step 2: Configure A Model
+
+Run the interactive configurator:
 
 ```powershell
 python "$HOME\.codex\skills\codex-model-bridge\scripts\model_bridge.py" configure --config "$HOME\.codex\model-bridge\config.json"
 ```
 
-For models that support it, the wizard asks whether the API accepts thinking, which request field and value style it uses, and whether thinking should be enabled by default. It supports object, string, boolean, and custom JSON values. It never asks for or stores an API key.
+The wizard asks for the provider, model, endpoint, tool name, environment variable name, and optional thinking behavior. It never asks for the API key itself and never stores a key in JSON.
 
-Run `configure` again to add or update another model. You can also edit the private JSON directly. Set `enabled` to `false` to keep a model definition without exposing its tool to Codex.
+Choose a provider preset or `custom`. For thinking-capable models, the wizard asks whether thinking is supported, how the provider encodes it, and whether it should be enabled by default.
 
-## Set API Keys
+At the end, the wizard prints local API key instructions for the configured model.
 
-Store secrets in environment variables named by your config, never in JSON. Example for Windows:
+## Step 3: Set The API Key Locally
 
-```powershell
-[Environment]::SetEnvironmentVariable("ZAI_API_KEY", "your-key", "User")
-```
-
-Open a new PowerShell window, or refresh the current process before testing:
+You can display the instructions again at any time:
 
 ```powershell
-$env:ZAI_API_KEY = [Environment]::GetEnvironmentVariable("ZAI_API_KEY", "User")
+python "$HOME\.codex\skills\codex-model-bridge\scripts\model_bridge.py" key-help --config "$HOME\.codex\model-bridge\config.json" --model glm-5-2
 ```
 
-On macOS or Linux, export the variable through your shell profile or secret manager:
+Replace `glm-5-2` with your configured model id when necessary.
+
+### Windows Example
+
+Create or copy the key in the provider's website, then run this command locally:
+
+```powershell
+[Environment]::SetEnvironmentVariable("ZAI_API_KEY", "PASTE_YOUR_KEY_HERE", "User")
+```
+
+Replace only `PASTE_YOUR_KEY_HERE`. Keep the environment variable name shown by `key-help`.
+
+**A successful `SetEnvironmentVariable` command prints nothing.** PowerShell simply returns to the `PS>` prompt. This is normal and does not mean that the command failed. Do not paste the key into chat to ask whether it worked.
+
+Verify safely without displaying the key:
+
+```powershell
+if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable("ZAI_API_KEY", "User"))) { "NOT SET" } else { "SET" }
+```
+
+Expected output:
+
+```text
+SET
+```
+
+This verification prints only `SET` or `NOT SET`; it never prints the key.
+
+After it prints `SET`, close that PowerShell window and open a new one. Existing terminals and already-running Codex processes do not automatically inherit changed user environment variables.
+
+### macOS / Linux Example
+
+Set the key in the current terminal:
 
 ```bash
-export ZAI_API_KEY="your-key"
+export ZAI_API_KEY='PASTE_YOUR_KEY_HERE'
 ```
 
-Fully exit and reopen Codex after adding or changing an environment variable. Already-running Codex processes cannot see the new value.
+`export` is also silent on success. Verify without displaying the key:
 
-## Diagnose And Test
+```bash
+if [ -n "${ZAI_API_KEY:-}" ]; then echo "SET"; else echo "NOT SET"; fi
+```
 
-Check configuration, key detection, enabled models, and thinking defaults without making a paid API call:
+This applies to the current terminal. Use the same terminal for testing. For persistence, use your shell profile or operating-system secret manager, then restart Codex from an environment that inherits the variable.
+
+## Step 4: Check The Local Setup
+
+Run `doctor` in the newly opened terminal. This check does not call the provider and does not consume model quota:
 
 ```powershell
 python "$HOME\.codex\skills\codex-model-bridge\scripts\model_bridge.py" doctor --config "$HOME\.codex\model-bridge\config.json"
 ```
 
-Make a low-cost GLM connectivity test:
+`key found via ZAI_API_KEY` means the new process can see an environment variable with that name. It does not prove that the key is valid.
+
+If `doctor` reports a missing key, run `key-help`, confirm that the variable name matches the model config, and open a new terminal after setting it.
+
+## Step 5: Make One Low-Cost Real Test
+
+Test the provider before adding the MCP entry to Codex:
 
 ```powershell
-python "$HOME\.codex\skills\codex-model-bridge\scripts\model_bridge.py" ask --config "$HOME\.codex\model-bridge\config.json" --model glm-5-2 --prompt "Reply with OK." --max-tokens 128 --thinking disabled
+python "$HOME\.codex\skills\codex-model-bridge\scripts\model_bridge.py" ask --config "$HOME\.codex\model-bridge\config.json" --model glm-5-2 --prompt "Reply exactly: OK" --max-tokens 32 --thinking disabled
 ```
 
-Omit `--thinking disabled` for a model whose API does not support that field.
+Use `--thinking disabled` only when `doctor` reports that thinking is supported. Omit that option for models that do not support it.
 
-## Connect To Codex
+Continue only after the model returns `OK`. This real request consumes a small amount of the external provider's quota, not the Codex model quota for the external response itself. Codex still consumes its normal usage when orchestrating tools later.
 
-Add the bridge to `~/.codex/config.toml`. Use forward slashes in Windows paths:
+## Step 6: Connect The Tested Model To Codex
+
+Add the bridge to `~/.codex/config.toml`. On Windows, use forward slashes in TOML paths:
 
 ```toml
 [mcp_servers.model_bridge]
@@ -94,15 +157,44 @@ command = "python"
 args = ["C:/Users/you/.codex/skills/codex-model-bridge/scripts/model_bridge.py", "serve", "--config", "C:/Users/you/.codex/model-bridge/config.json"]
 ```
 
-Restart Codex. The bridge exposes:
+Do not change the existing Codex `model`, `model_provider`, login, or authentication settings.
 
-- `model_bridge_status` for safe key and thinking diagnostics
-- One `ask_*` tool for each enabled model
-- `compare_external_models` when at least two models are enabled; models with missing keys are skipped by default
+Fully exit every Codex window and reopen Codex. The bridge exposes:
+
+- `model_bridge_status` for safe API key and thinking diagnostics
+- One `ask_*` tool for each enabled external model
+- `compare_external_models` when at least two models are enabled
+
+The external model remains an optional tool. It does not become the default Codex model.
+
+## Replace Or Rotate An API Key
+
+Use these steps when a key expires, is disabled, or may have been exposed:
+
+1. Create a new key in the external provider's console.
+2. Disable or revoke the old key in that console.
+3. Run `key-help` to confirm the environment variable name.
+4. Run the same local environment-variable command with the new value. The same name overwrites the old value.
+5. Remember that successful local setting is silent and produces no confirmation message.
+6. Use the safe `SET/NOT SET` command.
+7. Fully restart the terminal and Codex.
+8. Run `doctor`, followed by one low-cost real test.
+
+Do not edit `config.json` when only the key value changes. The JSON stores the environment variable name, not the key. Do not change Codex authentication settings.
+
+## Change The Model Or Thinking Settings
+
+Run `configure` again when changing the provider, endpoint, model id, tool name, or thinking behavior:
+
+```powershell
+python "$HOME\.codex\skills\codex-model-bridge\scripts\model_bridge.py" configure --config "$HOME\.codex\model-bridge\config.json"
+```
+
+This is separate from API key replacement.
 
 ## Manual Model Format
 
-Each item in `models` is independently customizable:
+Advanced users can edit each item in `models` directly:
 
 ```json
 {
@@ -122,13 +214,15 @@ Each item in `models` is independently customizable:
 }
 ```
 
-Only set a capability to `true` when that exact provider model documents the corresponding request field. For APIs that do not use Z.AI-style `{"thinking":{"type":"enabled"}}`, configure `thinking_field` and `thinking_values` through the wizard or JSON. Put other provider-specific defaults in `extra_body`. See `codex-model-bridge/references/providers.md` for examples.
+Only enable capabilities documented by that exact provider model. Use `thinking_field` and `thinking_values` for APIs that do not use Z.AI-style `{"thinking":{"type":"enabled"}}`. See `codex-model-bridge/references/providers.md` for examples.
 
-## Usage And Security
+## Security And Usage
 
-External calls consume the provider's quota. Codex usage is still consumed for orchestration, tool selection, and summarizing results.
-
-Never commit real API keys. If a key is exposed in chat, screenshots, logs, or Git history, rotate it in the provider console.
+- Never commit or publish a real API key.
+- Never ask a user to paste a key into an AI conversation.
+- If a key appears in chat, screenshots, logs, or Git history, revoke it and create a new one.
+- External calls consume the external provider's quota.
+- Codex remains the orchestrator and consumes its normal usage for tool selection and result handling.
 
 ## License
 

@@ -1,6 +1,6 @@
 ---
 name: codex-model-bridge
-description: Connect external OpenAI-compatible LLMs to Codex as MCP-powered external model agents. Use when the user wants to add, configure, test, or invoke models such as GLM, DeepSeek, Qwen, Kimi, Baichuan, OpenRouter, or other domestic and third-party models from Codex as reviewer, writer, planner, code critic, second-opinion agent, or model-comparison assistant.
+description: Connect external OpenAI-compatible LLMs to Codex as MCP-powered external model agents. Use when the user wants to add, configure, test, invoke, diagnose, or safely rotate API keys for models such as GLM, DeepSeek, Qwen, Kimi, Baichuan, OpenRouter, or other domestic and third-party models used from Codex as reviewer, writer, planner, code critic, second-opinion agent, or model-comparison assistant.
 ---
 
 # Codex Model Bridge
@@ -11,8 +11,12 @@ Use this skill to install and operate a local MCP server that exposes external L
 
 ## Safety Rules
 
+- Keep Codex as the orchestrator. Expose external models only as MCP `ask_*` tools.
+- Do not modify Codex's global `model`, `model_provider`, login, API endpoint, or authentication settings.
 - Never write API keys into Git-tracked files, Codex config, or examples.
+- Never ask the user to paste an API key into Codex or another chat. Have the user set it locally.
 - Store secrets in environment variables named by the bridge config.
+- Prefer provider-specific names such as `ZHIPU_API_KEY`; avoid `OPENAI_API_KEY` unless intentional.
 - Inspect generated configs before publishing or committing.
 - Prefer `thinking` or reasoning options only for providers that document them.
 - Tell the user that external model calls consume the provider's quota as well as normal Codex orchestration usage.
@@ -27,14 +31,21 @@ python path/to/scripts/model_bridge.py configure --config ~/.codex/model-bridge/
 ```
 
 3. When a model supports thinking, explicitly ask the user whether to enable it by default. Do not infer support for unknown APIs. The configurator records the choice without storing an API key.
-4. Set provider API keys as user environment variables, then restart the terminal and Codex so they inherit the new values.
-5. Run the local diagnostics:
+4. Run `key-help` and have the user set the key locally. Explain that successful PowerShell `SetEnvironmentVariable` and POSIX `export` commands are silent and simply return to the prompt:
+
+```bash
+python path/to/scripts/model_bridge.py key-help --config ~/.codex/model-bridge/config.json --model MODEL_ID
+```
+
+5. Have the user verify only `SET` or `NOT SET`; never display the key. Restart the terminal so it inherits the new value.
+6. Run the local diagnostics, then make one low-cost real request before editing Codex MCP config:
 
 ```bash
 python path/to/scripts/model_bridge.py doctor --config ~/.codex/model-bridge/config.json
+python path/to/scripts/model_bridge.py ask --config ~/.codex/model-bridge/config.json --model MODEL_ID --prompt "Reply exactly: OK" --max-tokens 32
 ```
 
-6. Add an MCP entry to Codex config pointing to the bridge server:
+7. Only after the real request succeeds, add an MCP entry to Codex config pointing to the bridge server:
 
 ```toml
 [mcp_servers.model_bridge]
@@ -42,8 +53,8 @@ command = "python"
 args = ["path/to/codex-model-bridge/scripts/model_bridge.py", "serve", "--config", "path/to/config.json"]
 ```
 
-7. Restart Codex so it reloads the MCP server.
-8. Use `model_bridge_status` first, then a configured model tool or `compare_external_models`.
+8. Restart Codex so it reloads the MCP server and new environment variables.
+9. Use `model_bridge_status` first, then a configured model tool or `compare_external_models`.
 
 ## Common Tasks
 
@@ -64,6 +75,10 @@ python path/to/scripts/model_bridge.py ask --config path/to/config.json --model 
 ```
 
 Use `--thinking disabled` only when `doctor` reports that thinking is supported.
+
+### Replace An API Key
+
+Tell the user to create a new key and revoke the old key in the provider console. Run `key-help` to identify the existing environment variable, then have the user run the same local command with the new value. State explicitly that success is silent, the variable name stays unchanged, and neither the bridge JSON nor Codex authentication needs editing. Fully restart the terminal and Codex, then run `doctor` and a low-cost real test.
 
 ### Expose Tools To Codex
 
